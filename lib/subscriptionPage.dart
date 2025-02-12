@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'dart:convert';
+import 'dart:math';
+import 'webViewPage.dart';
 
 class SubscriptionPage extends StatefulWidget {
   final int userId; // Accept userId
@@ -13,6 +15,12 @@ class SubscriptionPage extends StatefulWidget {
 
 class _SubscriptionPageState extends State<SubscriptionPage> {
   int? _subscribedPlanId;
+  bool _isLoading = false; // Add loading state
+  String?
+      _subscriptionMessage; // Add message to display when subscription exists
+
+  final String paymentUrl =
+      "http://10.0.2.2/minoriiproject/initiate_subscription.php"; // Khalti payment URL
 
   @override
   void initState() {
@@ -32,10 +40,12 @@ class _SubscriptionPageState extends State<SubscriptionPage> {
         if (responseData['success']) {
           setState(() {
             _subscribedPlanId = responseData['subscription_id'];
+            _subscriptionMessage = null; // Clear previous messages
           });
         } else {
           setState(() {
             _subscribedPlanId = null; // User is not subscribed
+            _subscriptionMessage = responseData['message']; // Display message
           });
         }
       }
@@ -46,22 +56,113 @@ class _SubscriptionPageState extends State<SubscriptionPage> {
 
   // Subscribe user to a plan
   Future<void> _subscribeUser(String planName) async {
-    final subscriptionId = _getSubscriptionId(planName);
-    DateTime now = DateTime.now();
-    DateTime endDate = now.add(const Duration(days: 30));
-
-    bool success =
-        await _subscribeUserToPlan(widget.userId, subscriptionId, now, endDate);
-
-    if (success) {
-      setState(() {
-        _subscribedPlanId =
-            subscriptionId; // Update UI to show the user is subscribed
-      });
-    } else {
+    if (_subscribedPlanId != null) {
+      // Prevent user from subscribing to another plan if they are already subscribed
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('You have already subscribed.')),
+        const SnackBar(content: Text('You are already subscribed to a plan.')),
       );
+      return;
+    }
+
+    setState(() {
+      _isLoading = true; // Show loading indicator
+    });
+
+    final subscriptionId = _getSubscriptionId(planName);
+    final amount = _getPlanPrice(planName) * 100;
+
+    // Step 1: Initiate Khalti payment
+    try {
+      final response = await http.post(
+        Uri.parse(paymentUrl),
+        body: {
+          "amount": amount.toString(),
+          "user_id": widget.userId.toString(),
+          "email": "user@example.com", // Replace with actual user email
+          "subscription_id": subscriptionId.toString(),
+          "order_id": "SUB-${Random().nextInt(99999)}", // Unique order ID
+        },
+      ).timeout(const Duration(seconds: 15));
+
+      final data = json.decode(response.body);
+
+      if (response.statusCode == 200) {
+        if (data['success'] == false && data['message'] != null) {
+          // Show message if the user is already subscribed
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text(data['message'])),
+          );
+          setState(() {
+            _isLoading = false; // Hide loading indicator
+          });
+          return;
+        }
+
+        if (data.containsKey('payment_url')) {
+          final paymentUrl = data['payment_url'];
+          final paymentId = data['payment_id']; // Get payment ID
+
+          // Step 2: Navigate to WebViewPage for payment
+          Navigator.push(
+            context,
+            MaterialPageRoute(
+              builder: (context) => WebViewPage(paymentUrl: paymentUrl),
+            ),
+          ).then((_) async {
+            // Step 3: After payment is completed, update payment status
+            bool success = await _updatePaymentStatus(
+                paymentId, "TRANSACTION_ID_FROM_KHALTI");
+
+            if (success) {
+              setState(() {
+                _subscribedPlanId = subscriptionId; // Update UI
+              });
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text('Subscription successful!')),
+              );
+            } else {
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text('Subscription failed.')),
+              );
+            }
+          });
+        } else {
+          print("Payment API Error: payment_url not found");
+        }
+      } else {
+        print("Payment API error: HTTP ${response.statusCode}");
+      }
+    } catch (e) {
+      print("Error during payment initiation: $e");
+    } finally {
+      setState(() {
+        _isLoading = false; // Hide loading indicator
+      });
+    }
+  }
+
+  // Update payment status after successful payment
+  Future<bool> _updatePaymentStatus(int paymentId, String transactionId) async {
+    final url = Uri.parse('http://10.0.2.2/minoriiproject/payment_success.php');
+
+    try {
+      final response = await http.post(
+        url,
+        body: {
+          "payment_id": paymentId.toString(),
+          "transaction_id": transactionId,
+        },
+      );
+
+      if (response.statusCode == 200) {
+        final responseData = json.decode(response.body);
+        return responseData['success'];
+      } else {
+        return false;
+      }
+    } catch (e) {
+      print("Error: $e");
+      return false;
     }
   }
 
@@ -79,81 +180,74 @@ class _SubscriptionPageState extends State<SubscriptionPage> {
     }
   }
 
-  // Subscribe user to a plan
-  Future<bool> _subscribeUserToPlan(int userId, int subscriptionId,
-      DateTime startDate, DateTime endDate) async {
-    final url = Uri.parse('http://10.0.2.2/minoriiproject/subscription.php');
-
-    final Map<String, dynamic> bodyData = {
-      'user_id': userId,
-      'subscription_id': subscriptionId,
-      'start_date': startDate.toIso8601String(),
-      'end_date': endDate.toIso8601String(),
-      'status': 'active',
-    };
-
-    print("Sending request to: $url");
-    print("Request Body: ${jsonEncode(bodyData)}");
-
-    try {
-      final response = await http.post(
-        url,
-        body: jsonEncode(bodyData),
-        headers: {'Content-Type': 'application/json'},
-      );
-
-      print("Response Code: ${response.statusCode}");
-      print("Response Body: ${response.body}");
-
-      if (response.statusCode == 200) {
-        final responseData = json.decode(response.body);
-        return responseData['success'];
-      } else {
-        return false;
-      }
-    } catch (e) {
-      print("Error: $e");
-      return false;
+  // Get plan price based on the plan name
+  double _getPlanPrice(String planName) {
+    switch (planName) {
+      case "Basic":
+        return 4000;
+      case "Premium":
+        return 5000;
+      case "Custom":
+        return 6000;
+      default:
+        return 0;
     }
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Subscription Plans'),
-        backgroundColor: const Color.fromARGB(255, 253, 228, 6),
-      ),
-      backgroundColor: const Color.fromARGB(255, 238, 233, 187),
-      body: ListView(
+      appBar: AppBar(title: const Text('Subscription Plans')),
+      body: Stack(
         children: [
-          SubscriptionCard(
-            planName: "Basic",
-            price: 4000,
-            mealsPerMonth: 20,
-            sweets: 0,
-            drinks: 0,
-            isSubscribed: _subscribedPlanId == 1,
-            onSubscribe: () => _subscribeUser("Basic"),
+          ListView(
+            children: [
+              if (_subscriptionMessage != null)
+                Padding(
+                  padding: const EdgeInsets.all(16.0),
+                  child: Text(
+                    _subscriptionMessage!,
+                    style: const TextStyle(color: Colors.red),
+                  ),
+                ),
+              SubscriptionCard(
+                planName: "Basic",
+                price: 4000,
+                mealsPerMonth: 20,
+                sweets: 0,
+                drinks: 0,
+                isSubscribed: _subscribedPlanId == 1,
+                onSubscribe: () => _subscribeUser("Basic"),
+                isAlreadySubscribed: _subscribedPlanId != null,
+              ),
+              SubscriptionCard(
+                planName: "Premium",
+                price: 5000,
+                mealsPerMonth: 29,
+                sweets: 0,
+                drinks: 0,
+                isSubscribed: _subscribedPlanId == 2,onSubscribe: () => _subscribeUser("Premium"),
+                isAlreadySubscribed: _subscribedPlanId != null,
+              ),
+              SubscriptionCard(
+                planName: "Custom",
+                price: 6000,
+                mealsPerMonth: 35,
+                sweets: 2,
+                drinks: 3,
+                isSubscribed: _subscribedPlanId == 3,
+                onSubscribe: () => _subscribeUser("Custom"),
+                isAlreadySubscribed: _subscribedPlanId != null,
+              ),
+            ],
           ),
-          SubscriptionCard(
-            planName: "Premium",
-            price: 5000,
-            mealsPerMonth: 29,
-            sweets: 0,
-            drinks: 0,
-            isSubscribed: _subscribedPlanId == 2,
-            onSubscribe: () => _subscribeUser("Premium"),
-          ),
-          SubscriptionCard(
-            planName: "Custom",
-            price: 6000,
-            mealsPerMonth: 35,
-            sweets: 2,
-            drinks: 3,
-            isSubscribed: _subscribedPlanId == 3,
-            onSubscribe: () => _subscribeUser("Custom"),
-          ),
+          if (_isLoading)
+            Container(
+              color: Colors.black45,
+              child: const Center(
+                child: CircularProgressIndicator(),
+              ),
+            ),
         ],
       ),
     );
@@ -167,6 +261,7 @@ class SubscriptionCard extends StatelessWidget {
   final int sweets;
   final int drinks;
   final bool isSubscribed;
+  final bool isAlreadySubscribed;
   final VoidCallback onSubscribe;
 
   const SubscriptionCard({
@@ -177,6 +272,7 @@ class SubscriptionCard extends StatelessWidget {
     required this.sweets,
     required this.drinks,
     required this.isSubscribed,
+    required this.isAlreadySubscribed,
     required this.onSubscribe,
   });
 
@@ -184,86 +280,25 @@ class SubscriptionCard extends StatelessWidget {
   Widget build(BuildContext context) {
     return Card(
       margin: const EdgeInsets.all(16),
-      elevation: 5, // Add some elevation for a shadow effect
-      shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(12), // Rounded corners
-      ),
-      child: Container(
-        padding: const EdgeInsets.all(16), // Add padding inside the container
-        decoration: BoxDecoration(
-          color: Colors.white,
-          borderRadius: BorderRadius.circular(12),
-          border: Border.all(
-            // Add border here
-            color: Colors.orange, // Border color
-            width: 2, // Border width
-          ),
+      child: ListTile(
+        title: Text(
+          planName,
+          style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
         ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              planName,
-              style: const TextStyle(
-                fontSize: 24, // Increased font size
-                fontWeight: FontWeight.bold,
-                color: Colors.orange,
-              ),
-            ),
-            const SizedBox(height: 10), // Add vertical space
-            Text(
-              "Price: \$${price.toString()} per month",
-              style: const TextStyle(
-                fontSize: 18, // Increased font size
-                color: Colors.black,
-              ),
-            ),
-            const SizedBox(height: 8), // Add vertical space
-            Text(
-              "Meals: $mealsPerMonth meals/month",
-              style: const TextStyle(
-                fontSize: 18, // Increased font size
-                color: Colors.black,
-              ),
-            ),
-            const SizedBox(height: 8), // Add vertical space
-            Text(
-              "Sweets: $sweets",
-              style: const TextStyle(
-                fontSize: 18, // Increased font size
-                color: Colors.black,
-              ),
-            ),
-            const SizedBox(height: 8), // Add vertical space
-            Text(
-              "Drinks: $drinks",
-              style: const TextStyle(
-                fontSize: 18, // Increased fontsize
-                color: Colors.black,
-              ),
-            ),
-            // const SizedBox(height: 5), // Add vertical space
-            Center(
-              child: ElevatedButton(
-                onPressed: isSubscribed ? null : onSubscribe,
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: isSubscribed ? Colors.grey : Colors.yellow,
-                  padding: const EdgeInsets.symmetric(
-                      horizontal: 24, vertical: 12), // Button padding
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(8), // Rounded button
-                  ),
-                ),
-                child: Text(
-                  isSubscribed ? 'Already Subscribed' : 'Subscribe',
-                  style: const TextStyle(
-                    fontSize: 18, // Increased font size
-                    color: Colors.black,
-                  ),
-                ),
-              ),
-            ),
-          ],
+        subtitle: Text("Price: \$${price.toString()} per month\n"
+            "Meals: $mealsPerMonth meals/month\n"
+            "Sweets: $sweets\nDrinks: $drinks"),
+        trailing: ElevatedButton(
+          onPressed: isAlreadySubscribed
+              ? null
+              : onSubscribe, // Disable if already subscribed
+          style: ElevatedButton.styleFrom(
+            backgroundColor: isAlreadySubscribed ? Colors.grey : Colors.yellow,
+          ),
+          child: Text(
+            isSubscribed ? 'Already Subscribed' : 'Subscribe',
+            style: const TextStyle(color: Colors.black),
+          ),
         ),
       ),
     );
